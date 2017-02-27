@@ -1,0 +1,200 @@
+---
+title: "Linear modeling of expression in IPF core samples"
+author: "[Alex Abbas](mailto:abbas@gene.com)"
+date: "`r Sys.Date()`"
+output:
+    html_document:
+      toc: yes
+      toc_depth: 4
+      theme: flatly
+      css : http://research.gene.com/people/abbas/css/tocWide.css
+---
+
+```{r global_options, include=F, echo=F}
+knitr::opts_chunk$set(fig.width=6, fig.height=6, fig.path='Figs/', echo=F, warning=FALSE, message=FALSE, include=T)
+```
+
+```{r load_packages, include=F, echo=F}
+library(knitr)
+library(Biobase)
+library(DT)
+library(ggplot2)
+library(reshape)
+#library(GGally)
+#library(ellipse)
+#library(RColorBrewer)
+```
+
+```{r package_options, include=F, echo=F}
+knitr::opts_knit$set(progress = TRUE, verbose = TRUE)
+# library(rmarkdown)
+# library(BiocStyle)
+# render('linearModel.Rmd', "html_document", '../results/linearModel.html')
+```
+
+```{r etc, include=F, echo=F}
+calcSignatureScores = function(dat=v,geneids=rownames(dat)) {
+  if (length(geneids)==1) {
+   return(dat[geneids,])
+  }
+  sliceids = geneids[geneids %in% rownames(dat)]
+  sigdat = dat[sliceids,]
+  pc1 = prcomp(t(sigdat))$x[,1]
+  meansig = apply(sigdat,2,mean)
+  if ( cor(pc1,meansig) < 0 ) { pc1 = - pc1 }
+  pc1 = pc1 * sd(meansig)/sd(pc1)
+  pc1 = pc1 + mean(meansig) - mean(pc1)
+  names(pc1) = colnames(dat)
+  pc1
+}
+myminor = unlist(lapply(c(-3:5),function(o){c(2:9)*10^o}))
+cv = function(x) { sd(x)/mean(x) }
+zscore = function(x) { (x - mean(x,na.rm=T)) / sd(x,na.rm=T) }
+```
+
+Hypothesis
+===
+Histopathological variables are related to differential expression. Build linear models to find these relationships. All analysis on this page is of log2-transformed RPKM data of *IPF patients only*.
+
+Analysis
+========
+```{r loadData, echo=F, include=F}
+load("../data/eset.RData")
+pheno = pData(eset)
+ipf = eset[,pheno$TISSUE_DIAGNOSIS=="IPF"]
+pheno = pData(ipf)
+exprs(ipf) = log2(exprs(ipf))
+
+histVars = c(
+ "AlveolarSurfaceDensityperMicro",
+ "Percent_VolumeFraction_TotalCollagen",
+ "AshcroftFibrosisScore_histology",
+ "No_TB_permL_MicroCT",
+ "Tissue_MicroCT",
+ "Neutrophil",
+ "Macrophage_CD68",
+ "Bcell_CD79a",
+ "CD4",
+ "CD8",
+ "Elastin",
+ "Col1",
+ "VvCol3",
+ "Eosinophils"
+)
+zHist = do.call(cbind,lapply(histVars,function(histVar){ zscore(pheno[,histVar]) } ))
+colnames(zHist) = paste0(histVars,"_z")
+rownames(zHist) = rownames(pheno)
+phenoz = cbind(pheno,zHist)
+pData(ipf) = phenoz
+geneids = featureNames(ipf)[fData(ipf)$type=="protein_coding"]
+ipf = ipf[geneids,]
+```
+
+Examine distributions of vars
+-------------
+I log-transformed and z-scored all continuous phenotypic variables to prepare for linear modeling. Let's verify that the distributions now look normal.
+
+```{r normal1, fig.width=9, fig.height=7, echo=F}
+zHistMelt = melt(phenoz,id.vars=1,measure.vars=colnames(zHist)[1:7])
+ggplot(zHistMelt, aes(value, color=variable)) + geom_density()
+```
+```{r normal2, fig.width=9, fig.height=7, echo=F}
+zHistMelt = melt(phenoz,id.vars=1,measure.vars=colnames(zHist)[8:14])
+ggplot(zHistMelt, aes(value, color=variable)) + geom_density()
+```
+
+
+Model expression by cell type
+-------------
+
+We have counts of six leukocyte types, let's model expression by the z-scores of those. Criteria: p < 0.05, absolute value of logFC > 0.5. Here log fold change is weird, it's actually the log2 expression change per standard deviation unit of the histology variable.
+
+Neutrophils, CD4 T cells, and eosinophils showed no differential expression.
+
+```{r leukfit, echo=F}
+pCutoff = 0.05
+lfcCutoff = 0.5
+design = model.matrix(~Neutrophil_z+Macrophage_CD68_z+Bcell_CD79a_z+CD4_z+CD8_z+Eosinophils_z, ipf) # create a design for linear modelling
+fit = eBayes(lmFit(ipf, design)) # run the model
+leuks = c("Neutrophil_z","Macrophage_CD68_z","Bcell_CD79a_z","CD4_z","CD8_z","Eosinophils_z")
+leuknames = c("Neut","Mac","Bcell","CD4","CD8","Eos")
+tts = lapply(leuks,function(leuk){ topTable(fit, coef=leuk, n=100000, p.value=1, lfc=0)[geneids,] })
+names(tts) = leuknames
+```
+
+```{r updown, echo=F, fig.width=8}
+updown = do.call(cbind,lapply(tts, function(sf) {
+ oneUpdown = rep(NA,times=dim(sf)[1])
+ oneUpdown[ sf$adj.P.Val < pCutoff & sf$logFC > lfcCutoff ] = "up"
+ oneUpdown[ sf$adj.P.Val < pCutoff & sf$logFC < -(lfcCutoff)  ] = "down"
+ names(oneUpdown) = rownames(sf)
+ oneUpdown
+}))
+colnames(updown) = leuknames
+updownTable = do.call(cbind,apply(updown,2,table))
+updownTable[2,] = -updownTable[2,]
+mycol = c("lightpink","lightblue")
+midpoints = barplot(updownTable, beside=TRUE, ylab="number of genes up (down)",col=mycol)
+adjustLabelY = function(vec) {
+ sapply(vec,function(x){
+  delta = 20
+  if (x < 0) { delta = -delta }
+  if (abs(x) < 50) { delta = -delta }
+  x - delta 
+ })
+}
+text(midpoints, adjustLabelY(updownTable), labels=abs(updownTable),cex=.8)
+abline(h=0,col="gray")
+```
+
+```{r topgenes, echo=F}
+tops = lapply(tts,function(tt){
+ ttsig = subset(tt,adj.P.Val < pCutoff & abs(logFC)>lfcCutoff)
+ tttop = ttsig[order(ttsig$logFC,decreasing=T),]
+ data.frame(
+  ID = rownames(tttop),
+  tttop[,c("symbol","desc","logFC","adj.P.Val")]
+ )
+})
+```
+
+Macrophages
+-------------
+
+```{r macs, echo=F}
+datatable(tops[[2]]) %>%
+  formatRound('logFC', 3) %>%
+  formatRound('adj.P.Val', 3)
+```
+
+B cells
+-------------
+
+```{r b, echo=F}
+datatable(tops[[3]]) %>%
+  formatRound('logFC', 3) %>%
+  formatRound('adj.P.Val', 3)
+```
+
+CD8 T cells
+-------------
+
+```{r cd8, echo=F}
+datatable(tops[[5]]) %>%
+  formatRound('logFC', 3) %>%
+  formatRound('adj.P.Val', 3)
+```
+
+Modules & Info
+==============
+```{r furlaniModules}
+system("module list 2>&1",intern=T)
+```
+
+```{r sessioninfo}
+sessionInfo()
+```
+
+
+
+
